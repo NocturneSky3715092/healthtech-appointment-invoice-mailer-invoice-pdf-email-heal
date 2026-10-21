@@ -1,0 +1,9 @@
+{
+  "id": "apt-1042",
+  "patient_name": "Morgan Lee",
+  "patient_email": "morgan@example.com",
+  "occurred_at": "2026-09-24T09:30:00Z",
+  "status": "completed",
+  "amount_cents": 12500,
+  "currency": "USD"
+}
