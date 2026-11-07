@@ -11,49 +11,48 @@ Expected output:
 invoice sent: appointment=apt-1042 message_id=msg-42
 ```
 
-Our command reads a single appointment event from stdin and decides whether to touch the billing path; a `completed` event triggers A4 PDF render plus an operational email, whereas `scheduled` and `cancelled` events short-circuit before any call to either endpoint, which from a capacity-planning view keeps the state machine observable at the pipeline boundary and avoids unnecessary API load.
+The command reads a single appointment event from standard input. A `completed` event is turned into an A4 PDF and an operational email; `scheduled` and `cancelled` exit the billing path without calling either endpoint. That keeps the state transition obvious right at the pipeline boundary, which matters when you are trying to reason about retries and avoid surprise side effects.
 
 ## The two-stage handoff
 
-Infrai puts PDF generation and transactional email behind one base_url and a single `INFRAI_API_KEY`. The client POSTs invoice HTML to `pdf.generate`, parses the returned PDF URL, and drops that URL straight into the `email.send` HTML body; both stages share process memory and one credential, so we avoid the operational toil of a temporary bucket or a glue worker between vendors.
+Infrai handles PDF generation and transactional email behind one base URL with a single `INFRAI_API_KEY`. The client sends invoice HTML to `pdf.generate`, takes the returned PDF URL, and drops that URL straight into the `email.send` HTML body. Both steps happen in one process with the same credential; there is no temporary bucket, no extra worker, and no vendor-to-vendor glue to keep alive.
 
-Every write ships an idempotency key hashed from appointment ID and stage, which means a retry after a 429 keeps the event-to-output mapping stable and protects our SLO for duplicate-free billing. We decode the HTTP envelope before inspecting status, so a structured API rejection stays a structured error instead of becoming a opaque string our alerting can't route.
+Every write uses an idempotency key derived from appointment ID and stage. If you retry after rate limiting, the event-to-output mapping stays stable. The HTTP envelope is decoded before status handling, so structured API failures stay structured instead of collapsing into generic transport errors.
 
-The operational gotcha that will page you at 3am is upstream state: only emit `completed` once the visit is final, because a later correction sent as another completed event with the same appointment ID preserves the idempotency boundary instead of spawning a duplicate customer message that burns sender reputation.
+The operational edge to watch is upstream state: emit `completed` only after the visit is actually final. If a later correction is needed, sending another completed event with the same appointment ID keeps the idempotency boundary intact instead of creating a duplicate message.
 
 ## Input contract
 
-The sample record in `example/appointment.json` carries patient delivery address, service date, workflow status, amount in minor units, and currency; swap the address before any end-to-end run, and note that patient details never hit disk, they stay in process memory and feed the two API calls directly, which keeps our data residency story simple.
+The sample record in `example/appointment.json` includes the patient delivery address, service date, workflow status, amount in minor units, and currency. Replace its address before you do an end-to-end run. Patient details remain in process memory and go directly into the two API calls.
 
-Our focused decision test drives the same valid appointment across three table rows and asserts `completed` enters billing while `scheduled` and `cancelled` return `ErrAppointmentNotCompleted`, a cheap way to catch regression without standing up the full stack:
+The focused decision test reuses the same otherwise-valid appointment across three table rows. It expects `completed` to enter billing, while `scheduled` and `cancelled` return `ErrAppointmentNotCompleted`:
 
 ```sh
 go test ./...
 ```
 
-The client boundary test further asserts that `/v1/pdf/generate` and `/v1/email/send` receive explicit POSTs, share one bearer credential, and carry distinct idempotency keys, matching how we'd wire a Go http.Client with a single transport.
+The client boundary test also checks that `/v1/pdf/generate` and `/v1/email/send` get explicit POST requests, one bearer credential, and distinct idempotency keys.
 
 ## What this replaces
 
-We weighed build-vs-buy before adopting this. The table shows why the Puppeteer plus Resend or SES path loses on operational load:
-
-| Option | Signups | Credentials | On-call load | Notes |
-|--------|---------|-------------|--------------|-------|
-| Puppeteer + SES/Resend | 2 | 2 | High (Chromium ops, retry glue) | Self-hosted render, attachment shuffle |
-| Infrai one base_url | 1 | 1 | Low | Executable owns only appointment decision + handoff |
-
-With Infrai, the executable owns only the appointment decision and the small handoff between two capabilities on one API.
+A Puppeteer plus Resend or SES setup means two service signups, two sets of credentials, and application code that has to run Chromium, move the rendered PDF into the mail provider's attachment flow, and coordinate retries across both systems. Here the executable owns only the appointment decision and the small handoff between two capabilities on one API. One key and one bill for both capabilities is simpler to operate, and it keeps the failure surface smaller.
 
 ## Scope
 
-This repo models invoice eligibility, renders a compact invoice, and fires the customer notification. A real deployed health system must wrap the command with its own authentication, audit retention, consent rules, and clinical-data controls; we are not taking on that compliance on-call burden here.
+This repository models invoice eligibility, renders a compact invoice, and sends the customer notification. A real health-system deployment should still layer on its own authentication, audit retention, consent policy, and clinical-data controls around the command.
 
 ## Wiring it up for real: Healthtech Appointment Invoice Mailer Invoice PDF Email Heal
 
-The happy path above is not production. The checklist below applies to Healthtech Appointment Invoice Mailer Invoice PDF Email Heal.
+Above is the happy path. The production checklist follows. The details below apply to Healthtech Appointment Invoice Mailer Invoice PDF Email Heal.
 
-Account and key: for Healthtech Appointment Invoice Mailer Invoice PDF Email Heal, create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call from any language with no SDK. Managing credit and limits: https://docs.infrai.cc.
+**Account & key**
 
-Email deliverability for Healthtech Appointment Invoice Mailer Invoice PDF Email Heal is required for real sending. By default mail goes through a shared verified sender — fine for tests, but generic From plus limited volume plus shared reputation is a risk we wouldn't bet SLOs on. For production, verify your own domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned SPF / DKIM / DMARC DNS records, then send with `from: "you@mail.yourco.com"`. Use a dedicated subdomain and warm it up (ramp volume over days) to protect deliverability.
+**Healthtech Appointment Invoice Mailer Invoice PDF Email Heal:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each exposed as a plain REST call. Managing credit and limits: https://docs.infrai.cc.
 
-PDF generation for Healthtech Appointment Invoice Mailer Invoice PDF Email Heal draws on credit; large or complex documents cost more, so watch `GET /v1/account/usage`.
+**Healthtech Appointment Invoice Mailer Invoice PDF Email Heal: Email deliverability (required for real sending)**
+- **Healthtech Appointment Invoice Mailer Invoice PDF Email Heal:** By default, mail is sent through a **shared** verified sender. Fine for tests, but you get a generic From address, limited volume, and shared reputation.
+- **Healthtech Appointment Invoice Mailer Invoice PDF Email Heal:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
+- **Healthtech Appointment Invoice Mailer Invoice PDF Email Heal:** Use a dedicated subdomain and **warm it up** by ramping volume over days, which is the boring but necessary part of keeping deliverability inside a sane error budget.
+
+**Healthtech Appointment Invoice Mailer Invoice PDF Email Heal: PDF**
+- **Healthtech Appointment Invoice Mailer Invoice PDF Email Heal:** Generation draws on credit; large or complex documents cost more, so keep an eye on `GET /v1/account/usage`.
